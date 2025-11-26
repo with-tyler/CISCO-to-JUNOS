@@ -2,6 +2,20 @@
 
 from typing import Dict, List, Any
 from .parser import CiscoConfig, VLANConfig, InterfaceConfig
+from .converter_extensions import (
+    convert_static_routes,
+    convert_ospf,
+    convert_radius,
+    convert_snmp,
+    convert_dhcp_snooping,
+    convert_vrfs,
+    convert_acls,
+    convert_port_mirroring,
+    convert_syslog,
+    convert_switch_mgmt,
+    convert_stp,
+    enhance_port_profile_with_advanced_features
+)
 
 
 class MistConverter:
@@ -22,11 +36,78 @@ class MistConverter:
             "switch_matching": self._generate_switch_matching(cisco_config, match_role),
         }
         
-        # Add spanning tree config if present
+        # Add advanced features from converter_extensions
+        
+        # Static routes (IPv4 and IPv6)
+        if cisco_config.static_routes:
+            routes = convert_static_routes(cisco_config.static_routes)
+            template.update(routes)
+        
+        # OSPF configuration
+        if cisco_config.ospf:
+            ospf_config = convert_ospf(cisco_config.ospf, cisco_config.ospf_interfaces or {})
+            template.update(ospf_config)
+        
+        # RADIUS configuration
+        if cisco_config.radius:
+            radius_config = convert_radius(cisco_config.radius)
+            template.update(radius_config)
+        
+        # SNMP configuration
+        if cisco_config.snmp:
+            snmp_config = convert_snmp(cisco_config.snmp)
+            template.update(snmp_config)
+        
+        # DHCP snooping
+        if cisco_config.dhcp_snooping:
+            dhcp_config = convert_dhcp_snooping(cisco_config.dhcp_snooping)
+            template.update(dhcp_config)
+        
+        # VRF instances
+        if cisco_config.vrfs:
+            vrf_config = convert_vrfs(cisco_config.vrfs)
+            template.update(vrf_config)
+        
+        # ACL policies
+        if cisco_config.access_lists:
+            acl_config = convert_acls(cisco_config.access_lists)
+            template.update(acl_config)
+        
+        # Port mirroring (SPAN)
+        if cisco_config.port_mirror_sessions:
+            mirror_config = convert_port_mirroring(cisco_config.port_mirror_sessions)
+            template.update(mirror_config)
+        
+        # Remote syslog
+        if cisco_config.syslog_servers:
+            syslog_config = convert_syslog(cisco_config.syslog_servers)
+            template.update(syslog_config)
+        
+        # Switch management (banner, users, TACACS+)
+        if cisco_config.banner or cisco_config.local_users or cisco_config.tacacs_servers or cisco_config.line_configs:
+            switch_mgmt = convert_switch_mgmt(
+                cisco_config.banner,
+                cisco_config.local_users or [],
+                cisco_config.line_configs or {},
+                cisco_config.tacacs_servers or []
+            )
+            template.update(switch_mgmt)
+        
+        # Spanning Tree Protocol configuration
+        if cisco_config.stp:
+            stp_config = convert_stp(cisco_config.stp)
+            template.update(stp_config)
+        
+        # Add spanning tree mode to additional_config_cmds for backward compatibility
+        additional_cmds = []
         if cisco_config.spanning_tree_mode:
-            template["additional_config_cmds"] = [
-                f"# Spanning Tree Mode: {cisco_config.spanning_tree_mode}"
-            ]
+            additional_cmds.append(f"# Spanning Tree Mode: {cisco_config.spanning_tree_mode}")
+        
+        if additional_cmds:
+            if "additional_config_cmds" in template:
+                template["additional_config_cmds"].extend(additional_cmds)
+            else:
+                template["additional_config_cmds"] = additional_cmds
         
         return template
 
@@ -82,16 +163,36 @@ class MistConverter:
         return port_usages
 
     def _interface_config_key(self, interface: InterfaceConfig) -> str:
-        """Generate a unique key for an interface configuration."""
+        """Generate a unique key for an interface configuration.
+        
+        Includes all interface fields for proper grouping.
+        """
         key_parts = [
             interface.mode,
             str(interface.access_vlan) if interface.access_vlan else "",
+            str(interface.voice_vlan) if interface.voice_vlan else "",
             str(interface.trunk_native_vlan) if interface.trunk_native_vlan else "",
             ",".join(map(str, sorted(interface.trunk_allowed_vlans))),
             str(interface.nonegotiate),
             str(interface.portfast),
             str(interface.bpduguard),
             str(interface.shutdown),
+            str(interface.speed) if interface.speed else "",
+            str(interface.duplex) if interface.duplex else "",
+            str(interface.poe_disabled) if interface.poe_disabled is not None else "",
+            str(interface.poe_priority) if interface.poe_priority else "",
+            str(interface.port_security) if interface.port_security else "",
+            str(interface.port_security_max) if interface.port_security_max else "",
+            str(interface.dot1x_pae) if interface.dot1x_pae else "",
+            str(interface.dot1x_port_control) if interface.dot1x_port_control else "",
+            str(interface.mab) if interface.mab else "",
+            str(interface.authentication_periodic) if interface.authentication_periodic else "",
+            str(interface.authentication_timer_reauthenticate) if interface.authentication_timer_reauthenticate else "",
+            str(interface.dhcp_snooping_trust) if interface.dhcp_snooping_trust else "",
+            str(interface.storm_control_broadcast) if interface.storm_control_broadcast else "",
+            str(interface.storm_control_multicast) if interface.storm_control_multicast else "",
+            str(interface.storm_control_unknown_unicast) if interface.storm_control_unknown_unicast else "",
+            str(interface.description) if interface.description else "",
         ]
         return "|".join(key_parts)
 
@@ -130,6 +231,9 @@ class MistConverter:
                 vlan = cisco_config.vlans.get(interface.access_vlan)
                 if vlan:
                     profile["networks"] = [vlan.name if vlan.name else f"VLAN{interface.access_vlan}"]
+            
+            # Apply advanced features even to disabled ports
+            profile = enhance_port_profile_with_advanced_features(profile, interface)
             return profile
         
         # Configure based on mode
@@ -166,7 +270,7 @@ class MistConverter:
         if interface.bpduguard:
             profile["enable_bpdu_guard"] = True
         
-        # Storm control
+        # Storm control (basic - will be enhanced by advanced features)
         if interface.storm_control_broadcast:
             profile["storm_control"] = {
                 "broadcast": interface.storm_control_broadcast
@@ -177,6 +281,9 @@ class MistConverter:
         # Disable negotiation (map to Mist equivalent)
         if interface.nonegotiate:
             profile["disable_autoneg"] = True
+        
+        # Apply all advanced features from converter_extensions
+        profile = enhance_port_profile_with_advanced_features(profile, interface)
         
         return profile
 
