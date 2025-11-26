@@ -1147,7 +1147,3 @@ python -m cisco_to_junos.cli configs/ --org-id PROD_ORG_ID
 **Contributions:** Pull requests welcome!
 
 ---
-
-**Last Updated:** November 26, 2025  
-**Version:** 2.0 - Complete Feature Implementation (95% API Coverage)  
-**License:** [Your License]
