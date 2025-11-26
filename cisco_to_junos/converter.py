@@ -331,10 +331,19 @@ class MistConverter:
     def _extract_simple_port_id(self, interface_name: str) -> str:
         """Extract simple port identifier from Cisco interface name.
         
+        Juniper EX switches use the following interface naming:
+        - ge-fpc/pic/port: Gigabit Ethernet (1G)
+        - xe-fpc/pic/port: 10 Gigabit Ethernet
+        - et-fpc/pic/port: 25G/40G/50G/100G+ Ethernet
+        
+        Note: Juniper does NOT use 'fe-' prefix. FastEthernet ports should map to 'ge-'
+        since modern Juniper switches start at Gigabit speeds.
+        
         Examples:
           GigabitEthernet1/0/5 -> ge-1/0/5
-          FastEthernet0/24 -> fe-0/24
-          GigabitEthernet0/1 -> ge-0/1
+          FastEthernet0/24 -> ge-0/0/24 (FastEthernet maps to ge, with normalized slot format)
+          GigabitEthernet0/1 -> ge-0/0/1
+          TenGigabitEthernet1/1/1 -> xe-1/1/1
         """
         import re
         
@@ -345,11 +354,21 @@ class MistConverter:
             if_type = match.group(1).lower()
             port_num = match.group(2)
             
-            # Convert to Junos-style naming
+            # Normalize port numbering to fpc/pic/port format
+            # Cisco uses slot/port or slot/module/port
+            # Juniper uses fpc/pic/port (all three required)
+            parts = port_num.split('/')
+            if len(parts) == 2:
+                # Cisco: slot/port -> Juniper: fpc/pic/port (add pic=0)
+                port_num = f"{parts[0]}/0/{parts[1]}"
+            
+            # Convert to Junos-style naming based on Cisco interface type
             if if_type.startswith('gigabit'):
                 prefix = 'ge'
             elif if_type.startswith('fast'):
-                prefix = 'fe'
+                # FastEthernet maps to ge- (Juniper switches don't have fe- prefix)
+                # Modern Juniper EX switches start at Gigabit speeds
+                prefix = 'ge'
             elif if_type.startswith('ten'):
                 prefix = 'xe'
             else:
