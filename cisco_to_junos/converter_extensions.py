@@ -31,20 +31,18 @@ def convert_static_routes(static_routes: List[StaticRoute]) -> Dict[str, List[Di
         # Determine destination (via or discard)
         if route.is_null_route:
             route_dict['discard'] = True
-            route_dict['via'] = f"{route.network}/{route.prefix_length}"
+            route_dict['via'] = route.destination
         else:
             # For Mist, via should be in format "network/prefix via next_hop"
             if route.next_hop:
-                route_dict['via'] = f"{route.network}/{route.prefix_length} via {route.next_hop}"
-            elif route.interface:
-                route_dict['via'] = f"{route.network}/{route.prefix_length} via {route.interface}"
+                route_dict['via'] = f"{route.destination} via {route.next_hop}"
             else:
                 # Shouldn't happen but handle gracefully
-                route_dict['via'] = f"{route.network}/{route.prefix_length}"
+                route_dict['via'] = route.destination
         
-        # Add optional parameters
-        if route.distance is not None:
-            route_dict['preference'] = route.distance
+        # Add optional parameters (metric is called 'metric' in StaticRoute, which is admin distance)
+        if route.metric is not None:
+            route_dict['preference'] = route.metric
         
         # Note: Cisco doesn't use 'metric' for static routes (it's 'distance'),
         # but we can map it if needed
@@ -90,9 +88,10 @@ def convert_ospf(ospf: Optional[OSPFConfig], ospf_interfaces: Dict[str, OSPFInte
                 'type': 'default'
             }
         
-        # Add network in CIDR format
+        # Convert wildcard mask to prefix length and add network in CIDR format
+        prefix_length = _wildcard_to_prefix(network.wildcard)
         ospf_areas[area_id]['networks'].append(
-            f"{network.network}/{network.prefix_length}"
+            f"{network.network}/{prefix_length}"
         )
     
     # Note: Mist API doesn't support per-area auth, passive interfaces, or
@@ -196,12 +195,12 @@ def convert_snmp(snmp: Optional[SNMPConfig]) -> Dict[str, Any]:
     # Convert communities to v2c_config
     if snmp.communities:
         v2c_config = []
-        for community in snmp.communities:
+        for community_string, access_level in snmp.communities.items():
             v2c_entry = {
-                'community': community.string,
-                'client_list_name': f"{community.string}_acl"
+                'community': community_string,
+                'client_list_name': f"{community_string}_acl"
             }
-            if community.access == 'RO':
+            if access_level == 'RO':
                 v2c_entry['view'] = 'view_ro'
             else:
                 v2c_entry['view'] = 'view_rw'
@@ -214,14 +213,15 @@ def convert_snmp(snmp: Optional[SNMPConfig]) -> Dict[str, Any]:
     if snmp.trap_hosts:
         trap_groups = []
         for trap_host in snmp.trap_hosts:
+            # trap_host is a dict with keys: host, version, community
             trap_group = {
-                'group_name': f"trap_{trap_host.host.replace('.', '_')}",
-                'version': trap_host.version or 'v2c',
-                'targets': [trap_host.host]
+                'group_name': f"trap_{trap_host['host'].replace('.', '_')}",
+                'version': trap_host.get('version', 'v2c'),
+                'targets': [trap_host['host']]
             }
-            if trap_host.community:
+            if 'community' in trap_host:
                 # Community is used in SNMP v2c traps
-                trap_group['community'] = trap_host.community
+                trap_group['community'] = trap_host['community']
             
             # Default categories - Cisco 'snmp-server enable traps' is very broad
             if snmp.enable_traps:
@@ -343,25 +343,25 @@ def convert_acls(acls: Dict[str, AccessList]) -> Dict[str, Any]:
                 action_dict['protocol'] = entry.protocol.lower()
             
             # Source
-            if entry.src_ip and entry.src_ip.lower() != 'any':
-                if entry.src_wildcard and entry.src_wildcard != '0.0.0.0':
+            if entry.source and entry.source.lower() != 'any':
+                if entry.source_wildcard and entry.source_wildcard != '0.0.0.0':
                     # Convert wildcard to prefix length
-                    action_dict['src_net'] = f"{entry.src_ip}/{_wildcard_to_prefix(entry.src_wildcard)}"
+                    action_dict['src_net'] = f"{entry.source}/{_wildcard_to_prefix(entry.source_wildcard)}"
                 else:
-                    action_dict['src_net'] = f"{entry.src_ip}/32"
+                    action_dict['src_net'] = f"{entry.source}/32"
             
             # Destination
-            if entry.dst_ip and entry.dst_ip.lower() != 'any':
-                if entry.dst_wildcard and entry.dst_wildcard != '0.0.0.0':
-                    action_dict['dst_net'] = f"{entry.dst_ip}/{_wildcard_to_prefix(entry.dst_wildcard)}"
+            if entry.destination and entry.destination.lower() != 'any':
+                if entry.destination_wildcard and entry.destination_wildcard != '0.0.0.0':
+                    action_dict['dst_net'] = f"{entry.destination}/{_wildcard_to_prefix(entry.destination_wildcard)}"
                 else:
-                    action_dict['dst_net'] = f"{entry.dst_ip}/32"
+                    action_dict['dst_net'] = f"{entry.destination}/32"
             
-            # Ports (if specified)
-            if entry.src_port:
-                action_dict['src_port'] = entry.src_port
-            if entry.dst_port:
-                action_dict['dst_port'] = entry.dst_port
+            # Port specification (may need parsing if present)
+            if entry.port_spec:
+                # Port spec might be something like "eq 80" or "range 1024 65535"
+                # For now, store as-is - proper parsing would depend on format
+                action_dict['port_spec'] = entry.port_spec
             
             actions.append(action_dict)
         
@@ -604,56 +604,33 @@ def enhance_port_profile_with_advanced_features(
     - DHCP snooping trust
     - Storm control
     - Port description
+    
+    Note: Only sets values that differ from the defaults already in port_profile.
     """
-    # Voice VLAN
+    # Voice VLAN - only set if configured
     if interface_config.voice_vlan:
-        port_profile['voip_network'] = str(interface_config.voice_vlan)
+        vlan_name = f"VLAN{interface_config.voice_vlan}"
+        port_profile['voip_network'] = vlan_name
     
-    # Speed
-    if interface_config.speed:
-        speed_map = {
-            '10': '100m',      # Cisco 10Mbps → Mist doesn't have 10m, use 100m
-            '100': '100m',
-            '1000': '1g',
-            '10000': '10g',
-            'auto': 'auto'
-        }
-        port_profile['speed'] = speed_map.get(str(interface_config.speed), 'auto')
+    # Speed - parser already converts to Mist format (1g, 10g, etc)
+    if interface_config.speed and interface_config.speed != 'auto':
+        port_profile['speed'] = interface_config.speed
     
-    # Duplex
-    if interface_config.duplex:
-        duplex_map = {
-            'full': 'full',
-            'half': 'half',
-            'auto': 'auto'
-        }
-        port_profile['duplex'] = duplex_map.get(interface_config.duplex, 'auto')
+    # Duplex - use as-is from parser
+    if interface_config.duplex and interface_config.duplex != 'auto':
+        port_profile['duplex'] = interface_config.duplex
     
-    # PoE
-    if interface_config.poe_disabled is not None:
-        port_profile['poe_disabled'] = interface_config.poe_disabled
+    # PoE - only set if explicitly disabled
+    if interface_config.poe_disabled is not None and interface_config.poe_disabled:
+        port_profile['poe_disabled'] = True
     
-    if interface_config.poe_priority:
-        # Map Cisco PoE priority to Mist
-        priority_map = {
-            'critical': 'critical',
-            'high': 'high',
-            'low': 'low'
-        }
-        if interface_config.poe_priority in priority_map:
-            # Note: Mist API doesn't have poe_priority field in standard schema
-            # Would go in additional_config_cmds
-            pass
-    
-    # Port security → MAC limit
+    # Port security → MAC limit - only set if configured
     if interface_config.port_security and interface_config.port_security_max:
         port_profile['mac_limit'] = interface_config.port_security_max
     
-    # 802.1X/MAB authentication
+    # 802.1X/MAB authentication - only set if configured
     if interface_config.dot1x_pae == 'authenticator':
-        port_auth: Dict[str, Any] = {
-            'enable': True
-        }
+        port_auth: Dict[str, Any] = {}
         
         if interface_config.dot1x_port_control:
             control_map = {
@@ -668,48 +645,43 @@ def enhance_port_profile_with_advanced_features(
         
         # MAB (MAC Authentication Bypass)
         if interface_config.mab:
-            port_auth['enable_mab'] = True
+            port_profile['enable_mac_auth'] = True
+            port_profile['mac_auth_only'] = False  # MAB with 802.1X
         
         # Reauthentication
-        if interface_config.authentication_periodic:
-            port_auth['reauth_enabled'] = True
-        
         if interface_config.authentication_timer_reauthenticate:
-            port_auth['reauth_interval'] = interface_config.authentication_timer_reauthenticate
+            port_profile['reauth_interval'] = interface_config.authentication_timer_reauthenticate
         
-        port_profile['port_auth'] = port_auth
+        # Set port_auth if we have control settings
+        if port_auth:
+            port_profile['port_auth'] = port_auth
     
     # DHCP snooping trust
     if interface_config.dhcp_snooping_trust:
         port_profile['allow_dhcpd'] = True
     
-    # Storm control
-    storm_control_set = False
-    storm_control: Dict[str, Any] = {}
-    
-    if interface_config.storm_control_broadcast:
-        storm_control['no_broadcast'] = False
-        storm_control['percentage'] = interface_config.storm_control_broadcast
-        storm_control_set = True
-    
-    if interface_config.storm_control_multicast:
-        storm_control['no_multicast'] = False
-        if 'percentage' not in storm_control:
-            storm_control['percentage'] = interface_config.storm_control_multicast
-        storm_control_set = True
-    
-    if interface_config.storm_control_unknown_unicast:
-        storm_control['no_unknown_unicast'] = False
-        if 'percentage' not in storm_control:
-            storm_control['percentage'] = interface_config.storm_control_unknown_unicast
-        storm_control_set = True
-    
-    if storm_control_set:
+    # Storm control - only set if configured
+    if (interface_config.storm_control_broadcast or 
+        interface_config.storm_control_multicast or 
+        interface_config.storm_control_unknown_unicast):
+        
+        storm_control: Dict[str, Any] = {}
+        
+        if interface_config.storm_control_broadcast:
+            storm_control['no_broadcast'] = False
+            storm_control['percentage'] = interface_config.storm_control_broadcast
+        
+        if interface_config.storm_control_multicast:
+            storm_control['no_multicast'] = False
+            if 'percentage' not in storm_control:
+                storm_control['percentage'] = interface_config.storm_control_multicast
+        
+        if interface_config.storm_control_unknown_unicast:
+            storm_control['no_unknown_unicast'] = False
+            if 'percentage' not in storm_control:
+                storm_control['percentage'] = interface_config.storm_control_unknown_unicast
+        
         port_profile['storm_control'] = storm_control
-    
-    # Description
-    if interface_config.description:
-        port_profile['description'] = interface_config.description
     
     return port_profile
 

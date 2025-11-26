@@ -36,6 +36,9 @@ class MistConverter:
             "switch_matching": self._generate_switch_matching(cisco_config, match_role),
         }
         
+        # Ensure all VLANs referenced by interfaces are in networks
+        template["networks"] = self._ensure_referenced_vlans(template["networks"], cisco_config)
+        
         # Add advanced features from converter_extensions
         
         # Static routes (IPv4 and IPv6)
@@ -112,12 +115,19 @@ class MistConverter:
         return template
 
     def _convert_vlans(self, vlans: Dict[int, VLANConfig]) -> Dict[str, Any]:
-        """Convert Cisco VLANs to Mist networks."""
+        """Convert Cisco VLANs to Mist networks.
+        
+        Note: Includes suspended VLANs since they may be referenced by port profiles
+        (e.g., as native VLAN for trunks or access VLAN for disabled ports).
+        Mist doesn't have a "suspend" state - VLANs are either defined or not.
+        
+        Also ensures VLAN 1 exists if not explicitly defined (Cisco default).
+        """
         networks = {}
         
         for vlan_id, vlan in vlans.items():
-            # Skip suspended VLANs
-            if vlan.state == "suspend":
+            # Skip VLAN 1 if no custom name - Mist has built-in "default" network
+            if vlan_id == 1 and not vlan.name:
                 continue
             
             network_name = vlan.name if vlan.name else f"VLAN{vlan_id}"
@@ -125,6 +135,52 @@ class MistConverter:
                 "vlan_id": vlan_id,
                 "subnet": "",  # Will need to be filled in or detected
             }
+        
+        # Note: We don't add VLAN 1 - Mist has a built-in "default" network for it
+        # If VLAN 1 has a custom name in Cisco config, it will be added above
+        
+        return networks
+    
+    def _ensure_referenced_vlans(self, networks: Dict[str, Any], cisco_config: CiscoConfig) -> Dict[str, Any]:
+        """Ensure all VLANs referenced by interfaces exist in networks dict.
+        
+        This handles cases where interfaces reference VLANs that weren't explicitly
+        defined in the VLAN database (common in Cisco configs).
+        """
+        referenced_vlans = set()
+        
+        # Collect all VLAN IDs referenced by interfaces
+        for interface in cisco_config.interfaces.values():
+            if interface.access_vlan:
+                referenced_vlans.add(interface.access_vlan)
+            if interface.voice_vlan:
+                referenced_vlans.add(interface.voice_vlan)
+            if interface.trunk_native_vlan:
+                referenced_vlans.add(interface.trunk_native_vlan)
+            if interface.trunk_allowed_vlans:
+                referenced_vlans.update(interface.trunk_allowed_vlans)
+        
+        # Add any missing VLANs to networks
+        for vlan_id in referenced_vlans:
+            # Skip VLAN 1 - Mist has a built-in "default" network for it
+            # Port profiles will reference "default" but we don't add it to networks
+            if vlan_id == 1:
+                continue
+                
+            # Check if already defined (by name or as VLANxx)
+            vlan_exists = False
+            for network_data in networks.values():
+                if network_data.get("vlan_id") == vlan_id:
+                    vlan_exists = True
+                    break
+            
+            if not vlan_exists:
+                # VLAN not defined - create it
+                network_name = f"VLAN{vlan_id}"
+                networks[network_name] = {
+                    "vlan_id": vlan_id,
+                    "subnet": "",
+                }
         
         return networks
 
@@ -145,7 +201,7 @@ class MistConverter:
             
             if config_key not in profile_map:
                 # Generate profile name based on the interface config
-                profile_name = self._generate_profile_name(interface, len(profile_map))
+                profile_name = self._generate_profile_name(interface, cisco_config)
                 profile_map[config_key] = (profile_name, interface, [])
             
             profile_map[config_key][2].append(interface_name)
@@ -196,72 +252,196 @@ class MistConverter:
         ]
         return "|".join(key_parts)
 
-    def _generate_profile_name(self, interface: InterfaceConfig, index: int) -> str:
-        """Generate a descriptive profile name."""
+    def _generate_profile_name(self, interface: InterfaceConfig, cisco_config: CiscoConfig) -> str:
+        """Generate a descriptive profile name based on interface configuration.
+        
+        Name must follow Mist rules: a-z, A-Z, 0-9, _, - only, start with letter, max 32 chars.
+        """
         if interface.shutdown:
             return "Disabled-Ports"
-        elif interface.mode == "access" and interface.access_vlan:
-            # Include additional attributes for unique naming
-            suffix = ""
-            if interface.portfast:
-                suffix += "-Portfast"
-            if interface.bpduguard:
-                suffix += "-BPDUGuard"
-            return f"Access-VLAN{interface.access_vlan}{suffix}"
-        elif interface.mode == "trunk":
+        
+        # Determine mode based on configuration (mode field might not be explicitly set)
+        is_trunk = interface.mode == "trunk" or (interface.trunk_allowed_vlans and len(interface.trunk_allowed_vlans) > 0)
+        is_access = interface.mode == "access" or (interface.access_vlan and not is_trunk)
+        
+        if is_access:
+            # Find VLAN name for access port
+            vlan_id = interface.access_vlan
+            vlan_name = None
+            if vlan_id and cisco_config.vlans:
+                for vlan in cisco_config.vlans.values():
+                    if vlan.id == vlan_id:
+                        vlan_name = vlan.name
+                        break
+            
+            # Build descriptive name (no parentheses - use hyphens only)
+            if vlan_name:
+                name = f"{vlan_name}-{vlan_id}-Access"
+            elif vlan_id:
+                name = f"VLAN{vlan_id}-Access"
+            else:
+                name = "Access-NoVLAN"
+            
+            # Add feature suffixes (excluding STP features)
+            features = []
+            if interface.voice_vlan:
+                features.append(f"Voice{interface.voice_vlan}")
+            if interface.dot1x_pae:
+                features.append("Dot1x")
+            if interface.port_security:
+                features.append("PortSec")
+            
+            if features:
+                name += "-" + "-".join(features)
+            
+            # Ensure name is valid (max 32 chars, starts with letter)
+            name = name.replace(" ", "-")  # Replace any spaces
+            if len(name) > 32:
+                # Truncate but keep meaningful parts
+                if vlan_name and vlan_id:
+                    name = f"VLAN{vlan_id}-Access"
+                    if features:
+                        name += "-" + features[0]  # Add first feature only
+            
+            return name
+        
+        elif is_trunk:
             # Create trunk profile name based on allowed VLANs
             if interface.trunk_allowed_vlans:
-                vlan_range = f"{min(interface.trunk_allowed_vlans)}-{max(interface.trunk_allowed_vlans)}"
-                return f"Trunk-VLANs-{vlan_range}"
-            return f"Trunk-Profile"
+                vlans = sorted(interface.trunk_allowed_vlans)
+                if len(vlans) == 1:
+                    vlan_desc = f"VLAN{vlans[0]}"
+                elif len(vlans) <= 5:
+                    vlan_desc = "VLANs-" + "-".join(map(str, vlans))
+                else:
+                    vlan_desc = f"VLANs-{min(vlans)}-to-{max(vlans)}"
+                
+                name = f"Trunk-{vlan_desc}"
+            else:
+                name = "Trunk-AllVLANs"
+            
+            # Add native VLAN if set and not default
+            if interface.trunk_native_vlan and interface.trunk_native_vlan != 1:
+                suffix = f"-Native{interface.trunk_native_vlan}"
+                if len(name) + len(suffix) <= 32:
+                    name += suffix
+            
+            return name
+        
         else:
-            return f"Unconfig-Port-{index+1}"
+            # Fallback for unconfigured/unknown mode
+            return "Unconfigured-Port"
 
     def _create_port_profile(self, interface: InterfaceConfig, cisco_config: CiscoConfig) -> Dict[str, Any]:
-        """Create a Mist port profile from an interface configuration."""
-        profile = {
-            "description": f"Converted from Cisco config: {interface.name}",
+        """Create a Mist port profile from an interface configuration.
+        
+        Generates a complete port profile matching the Mist API schema.
+        """
+        # Start with base profile with proper defaults
+        profile: Dict[str, Any] = {
+            "mode": interface.mode if interface.mode else "access",
+            "disabled": interface.shutdown if interface.shutdown else False,
+            "all_networks": False,
+            "enable_qos": False,
+            "mac_limit": 0,
+            "persist_mac": False,
+            "disable_autoneg": False,
+            "poe_disabled": False,
+            "speed": "auto",
+            "duplex": "auto",
+            "storm_control": {},
+            "networks": None,
+            "port_network": None,
+            "voip_network": None,
+            "stp_edge": False,
+            "enable_bpdu_guard": False,
+            "stp_disable": False,
+            "stp_required": False,
+            "stp_p2p": False,
+            "stp_no_root_port": False,
+            "use_vstp": False,
+            "port_auth": None,
+            "allow_multiple_supplicants": None,
+            "enable_mac_auth": None,
+            "mac_auth_only": None,
+            "mac_auth_preferred": None,
+            "guest_network": None,
+            "bypass_auth_when_server_down": None,
+            "bypass_auth_when_server_down_for_unknown_client": None,
+            "dynamic_vlan_networks": None,
+            "server_reject_network": None,
+            "server_fail_network": None,
+            "mac_auth_protocol": None,
+            "reauth_interval": None,
+            "mtu": None
         }
         
-        if interface.shutdown:
-            profile["disabled"] = True
-            profile["mode"] = "access"
-            if interface.access_vlan:
-                # Get VLAN name for disabled ports
-                vlan = cisco_config.vlans.get(interface.access_vlan)
-                if vlan:
-                    profile["networks"] = [vlan.name if vlan.name else f"VLAN{interface.access_vlan}"]
-            
-            # Apply advanced features even to disabled ports
-            profile = enhance_port_profile_with_advanced_features(profile, interface)
-            return profile
+        # Add description if present
+        if interface.description:
+            profile["description"] = interface.description
+        else:
+            profile["description"] = f"Converted from Cisco config: {interface.name}"
         
         # Configure based on mode
-        if interface.mode == "access":
-            profile["mode"] = "access"
-            if interface.access_vlan:
-                vlan = cisco_config.vlans.get(interface.access_vlan)
-                if vlan:
-                    profile["networks"] = [vlan.name if vlan.name else f"VLAN{interface.access_vlan}"]
-        
-        elif interface.mode == "trunk":
+        # Default to access mode if not explicitly set and has access_vlan
+        # (Cisco default behavior)
+        if interface.mode == "trunk" or "trunk" in interface.mode:
             profile["mode"] = "trunk"
             profile["all_networks"] = False
+            profile["port_network"] = None  # Trunks don't use port_network
             
-            # Add allowed VLANs
+            # For TRUNK mode: use networks (array)
             if interface.trunk_allowed_vlans:
                 networks = []
                 for vlan_id in interface.trunk_allowed_vlans:
                     vlan = cisco_config.vlans.get(vlan_id)
                     if vlan:
-                        networks.append(vlan.name if vlan.name else f"VLAN{vlan_id}")
+                        if vlan.name:
+                            networks.append(vlan.name)
+                        else:
+                            networks.append("default" if vlan_id == 1 else f"VLAN{vlan_id}")
+                    else:
+                        networks.append("default" if vlan_id == 1 else f"VLAN{vlan_id}")
                 profile["networks"] = networks
             
-            # Native VLAN
+            # Native VLAN for trunks
             if interface.trunk_native_vlan:
                 vlan = cisco_config.vlans.get(interface.trunk_native_vlan)
                 if vlan:
-                    profile["native_network"] = vlan.name if vlan.name else f"VLAN{interface.trunk_native_vlan}"
+                    if vlan.name:
+                        profile["native_network"] = vlan.name
+                    else:
+                        profile["native_network"] = "default" if interface.trunk_native_vlan == 1 else f"VLAN{interface.trunk_native_vlan}"
+                else:
+                    profile["native_network"] = "default" if interface.trunk_native_vlan == 1 else f"VLAN{interface.trunk_native_vlan}"
+        
+        else:
+            # Default to access mode (Cisco default when not specified)
+            profile["mode"] = "access"
+            profile["all_networks"] = False
+            
+            # For ACCESS mode: use port_network (string), NOT networks (array)
+            if interface.access_vlan:
+                vlan = cisco_config.vlans.get(interface.access_vlan)
+                if vlan:
+                    # Use custom name if defined, otherwise VLAN{id} (or "default" for VLAN 1)
+                    if vlan.name:
+                        profile["port_network"] = vlan.name
+                    else:
+                        profile["port_network"] = "default" if interface.access_vlan == 1 else f"VLAN{interface.access_vlan}"
+                else:
+                    # VLAN referenced but not defined - use Mist's "default" for VLAN 1
+                    profile["port_network"] = "default" if interface.access_vlan == 1 else f"VLAN{interface.access_vlan}"
+            else:
+                # No access VLAN configured - default to VLAN 1 (Cisco default)
+                # Use Mist's built-in "default" network
+                vlan = cisco_config.vlans.get(1)
+                if vlan and vlan.name:
+                    profile["port_network"] = vlan.name
+                else:
+                    profile["port_network"] = "default"
+            
+            profile["networks"] = None  # Must be null for access ports
         
         # STP settings
         if interface.portfast:
@@ -270,19 +450,12 @@ class MistConverter:
         if interface.bpduguard:
             profile["enable_bpdu_guard"] = True
         
-        # Storm control (basic - will be enhanced by advanced features)
-        if interface.storm_control_broadcast:
-            profile["storm_control"] = {
-                "broadcast": interface.storm_control_broadcast
-            }
-            if interface.storm_control_multicast:
-                profile["storm_control"]["multicast"] = interface.storm_control_multicast
-        
-        # Disable negotiation (map to Mist equivalent)
+        # Disable autonegotiation
         if interface.nonegotiate:
             profile["disable_autoneg"] = True
         
         # Apply all advanced features from converter_extensions
+        # This will add: voice VLAN, speed, duplex, PoE, port auth, storm control, etc.
         profile = enhance_port_profile_with_advanced_features(profile, interface)
         
         return profile

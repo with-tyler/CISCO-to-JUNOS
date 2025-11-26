@@ -430,8 +430,10 @@ class CiscoConfigParser:
         expanded_content = self._expand_interface_ranges(content)
         
         # Find all interface blocks
+        # Match lines that are either indented (start with space) or 
+        # non-indented commands (for malformed configs without indentation)
         interface_blocks = re.finditer(
-            r'^interface\s+(\S+)\s*\n((?:^[ ].*\n)*)',
+            r'^interface\s+(\S+)\s*\n((?:^(?:[ ]|\S).*\n)*?)(?=^interface\s|\Z)',
             expanded_content,
             re.MULTILINE
         )
@@ -469,13 +471,13 @@ class CiscoConfigParser:
         if mode_match:
             interface.mode = mode_match.group(1)
         
-        # Parse access VLAN
-        access_match = re.search(r'^\s+switchport access vlan\s+(\d+)', interface_content, re.MULTILINE)
+        # Parse access VLAN (with or without leading whitespace)
+        access_match = re.search(r'^\s*switchport access vlan\s+(\d+)', interface_content, re.MULTILINE)
         if access_match:
             interface.access_vlan = int(access_match.group(1))
         
-        # Parse voice VLAN
-        voice_match = re.search(r'^\s+switchport voice vlan\s+(\d+)', interface_content, re.MULTILINE)
+        # Parse voice VLAN (with or without leading whitespace)
+        voice_match = re.search(r'^\s*switchport voice vlan\s+(\d+)', interface_content, re.MULTILINE)
         if voice_match:
             interface.voice_vlan = int(voice_match.group(1))
         

@@ -203,6 +203,14 @@ def main():
         
         if authenticator.authenticate(interactive=not args.no_interactive):
             print("   ✓ Authentication verified")
+            
+            # Show org ID info if available
+            org_id = args.org_id or authenticator.org_id
+            if org_id:
+                print(f"   ✓ Organization ID: {org_id}")
+            else:
+                print(f"   ℹ️  No organization ID configured (use --org-id or set MIST_ORG_ID in .env)")
+            
             print("\n✅ Dry-run complete!")
             print(f"   - Template saved to: {args.output}")
             print(f"   - Ready to submit when dry-run is disabled")
@@ -219,13 +227,24 @@ def main():
             print("❌ Authentication failed")
             sys.exit(1)
         
-        # Get org ID
-        org_id = args.org_id
+        # Get org ID - priority: CLI arg > .env > interactive prompt
+        org_id = args.org_id or authenticator.org_id
+        
         if not org_id and not args.no_interactive:
             org_id = questionary.text(
                 "Enter Mist Organization ID:",
                 validate=lambda x: len(x) > 0 or "Organization ID is required"
             ).ask()
+            
+            # Offer to save org ID to .env
+            if org_id and not authenticator.org_id:
+                save_org = questionary.confirm(
+                    f"Save organization ID to {args.env_file} for future use?",
+                    default=True
+                ).ask()
+                
+                if save_org:
+                    authenticator.save_org_id(org_id)
         
         if not org_id:
             print("❌ Organization ID is required for submission")

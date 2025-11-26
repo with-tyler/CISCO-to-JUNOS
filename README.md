@@ -131,7 +131,7 @@ pip install -r requirements.txt
 
 ### 2. Set Up Mist Credentials
 
-The tool supports **two authentication methods**:
+The tool supports **flexible authentication** with automatic token creation and smart recovery.
 
 #### Option A: API Token (Recommended)
 
@@ -142,6 +142,7 @@ Create a `.env` file in the project root:
 # https://manage.mist.com/admin/?org_id=YOUR_ORG_ID#!api
 MIST_API_KEY=your-mist-api-token
 MIST_HOST=api.mist.com
+MIST_ORG_ID=your-organization-id  # Optional: Skip org ID prompts
 ```
 
 **How to Generate a Mist API Token:**
@@ -153,6 +154,12 @@ MIST_HOST=api.mist.com
 5. Give it a name (e.g., "Cisco to Junos Converter")
 6. Copy the token and paste it into your `.env` file
 
+**How to Find Your Organization ID:**
+
+1. Log into the Mist dashboard
+2. Look at the URL: `https://manage.mist.com/admin/?org_id=YOUR_ORG_ID`
+3. Copy the org_id value and add it to `.env` as `MIST_ORG_ID`
+
 > **Security Note:** API tokens have the same permissions as your user account. Keep them secure and don't commit them to version control.
 
 #### Option B: Email/Password (Supports 2FA)
@@ -163,13 +170,14 @@ Alternatively, use email and password authentication:
 MIST_EMAIL=your-email@example.com
 MIST_PASSWORD=your-password
 MIST_HOST=api.mist.com
+MIST_ORG_ID=your-organization-id  # Optional: Skip org ID prompts
 ```
 
 This method supports **two-factor authentication (2FA)**. If your account has 2FA enabled, you'll be prompted during login.
 
 > **Note:** Password is stored in plaintext in `.env`. For better security, use API tokens or interactive login.
 
-#### Option C: Interactive Login
+#### Option C: Interactive Login with Automatic Token Creation
 
 If you skip the `.env` file, the tool uses **mistapi's interactive login** which prompts for credentials:
 
@@ -187,13 +195,44 @@ Please follow the prompts...
 ? Mist Host: api.mist.com
 # mistapi will then prompt for your preferred auth method
 ✓ Authentication successful
+
+💡 Create an API token for future use? (Recommended - no password needed)
+? Create API token: Yes
+🔑 Creating API token...
+? Token name: cisco-to-junos-converter
+✓ API token 'cisco-to-junos-converter' created successfully
+
+? Save credentials to .env for future use? Yes
+✓ Credentials saved to .env
 ```
 
 **Benefits of Interactive Login:**
 - ✅ Choose authentication method at runtime (email/password or API token)
 - ✅ Automatic 2FA handling
-- ✅ No credentials stored in files
+- ✅ **Offers to create API token automatically** - no manual dashboard setup needed
+- ✅ **Saves credentials to .env** for future use
 - ✅ Powered by mistapi's battle-tested login flow
+
+#### Smart Authentication Recovery
+
+If your API token expires or becomes invalid, the tool **automatically offers to create a new one**:
+
+```
+✓ Loaded API token from .env
+⚠️  API token authentication failed
+
+💡 Your API token is invalid or expired.
+? Would you like to authenticate with email/password to create a new token? Yes
+
+# After successful login...
+💡 Create an API token for future use?
+? Create API token: Yes
+🔑 Creating API token...
+✓ API token created successfully
+✓ Credentials saved to .env
+```
+
+**All .env updates preserve existing fields** - your org ID, host, and other settings are never lost when credentials are updated.
 
 
 ### 3. Prepare Your Cisco Configs
@@ -276,8 +315,13 @@ python -m cisco_to_junos.cli configs/ -o campus-switches.json --dry-run
 | `--dry-run` | Validate and export without submitting | Submit to Mist |
 | `--no-interactive` | Skip all prompts, use defaults | Interactive |
 | `--skip-additional-config` | Skip DNS/NTP/RADIUS/role prompts | Prompt for all |
-| `--org-id` | Mist organization ID | Prompt if needed |
+| `--org-id` | Mist organization ID (overrides .env) | Use `MIST_ORG_ID` from .env or prompt |
 | `--env-file` | Path to credentials file | `.env` |
+
+**Organization ID Priority:**
+1. `--org-id` command line argument (highest priority)
+2. `MIST_ORG_ID` from `.env` file
+3. Interactive prompt (if not provided above)
 
 ---
 
