@@ -1,0 +1,19 @@
+[project]
+name = "cisco-to-junos"
+version = "0.1.0"
+description = "Convert Cisco switch configurations to Juniper Mist JSON templates"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "mistapi>=0.10.0",
+    "python-dotenv>=1.0.0",
+    "questionary>=2.0.0",
+    "keyring>=25.0.0",
+]
+
+[project.scripts]
+cisco-to-junos = "cisco_to_junos.cli:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_backend"
